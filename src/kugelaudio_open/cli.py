@@ -20,6 +20,9 @@ Examples:
   # Generate speech from command line
   kugelaudio generate "Hello world!" -o output.wav
   
+  # Generate with a specific voice
+  kugelaudio generate "Hello world!" --voice default -o output.wav
+  
   # Check watermark in audio file
   kugelaudio verify audio.wav
         """,
@@ -37,7 +40,9 @@ Examples:
     gen_parser = subparsers.add_parser("generate", help="Generate speech from text")
     gen_parser.add_argument("text", help="Text to synthesize")
     gen_parser.add_argument("-o", "--output", default="output.wav", help="Output file path")
-    gen_parser.add_argument("-r", "--reference", help="Reference audio for voice cloning")
+    gen_parser.add_argument(
+        "-v", "--voice", help="Pre-encoded voice name (from voices.json registry)"
+    )
     gen_parser.add_argument("--model", default="kugelaudio/kugelaudio-0-open", help="Model ID")
     gen_parser.add_argument("--cfg-scale", type=float, default=3.0, help="Guidance scale")
 
@@ -58,6 +63,7 @@ Examples:
 
     elif args.command == "generate":
         import torch
+
         from kugelaudio_open.models import KugelAudioForConditionalGenerationInference
         from kugelaudio_open.processors import KugelAudioProcessor
 
@@ -72,12 +78,11 @@ Examples:
 
         processor = KugelAudioProcessor.from_pretrained(args.model)
 
-        # Process inputs (voice_prompt passed to processor for proper handling)
-        inputs = processor(
-            text=args.text,
-            voice_prompt=args.reference,  # Pass reference audio path directly
-            return_tensors="pt"
-        )
+        # Strip encoders to save VRAM (only decoders needed for inference)
+        model.model.strip_encoders()
+
+        # Process inputs with optional pre-encoded voice
+        inputs = processor(text=args.text, voice=args.voice, return_tensors="pt")
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
         print("Generating speech...")
@@ -98,6 +103,7 @@ Examples:
     elif args.command == "verify":
         import numpy as np
         import soundfile as sf
+
         from kugelaudio_open.watermark import AudioWatermark
 
         audio, sr = sf.read(args.audio)

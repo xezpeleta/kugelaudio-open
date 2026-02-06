@@ -1,14 +1,18 @@
 """KugelAudio - Open Source Text-to-Speech Model
 
 KugelAudio is a state-of-the-art neural text-to-speech model that generates
-natural, expressive speech from text with voice cloning capabilities.
+natural, expressive speech from text using pre-encoded voices.
+
+Note:
+    Voice cloning from raw audio is not supported. Use pre-encoded voices
+    from the voices.json registry instead.
 
 Example:
-    >>> from kugelaudio import KugelAudioForConditionalGenerationInference
-    >>> from transformers import AutoModel
-    >>>
-    >>> # Load the model
-    >>> model = AutoModel.from_pretrained("kugelaudio/kugelaudio-0-open")
+    >>> from kugelaudio_open import KugelAudioForConditionalGenerationInference, KugelAudioProcessor
+    >>> model = KugelAudioForConditionalGenerationInference.from_pretrained("kugelaudio/kugelaudio-0-open")
+    >>> model.model.strip_encoders()  # Free VRAM
+    >>> processor = KugelAudioProcessor.from_pretrained("kugelaudio/kugelaudio-0-open")
+    >>> inputs = processor(text="Hello world!", voice="default", return_tensors="pt")
 """
 
 __version__ = "0.1.0"

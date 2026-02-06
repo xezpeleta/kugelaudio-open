@@ -1,42 +1,32 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Callable
-from tqdm import tqdm
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-
-from transformers.models.auto import AutoModel, AutoModelForCausalLM
-
+from tqdm import tqdm
+from transformers import modeling_utils
 from transformers.activations import ACT2FN
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
-    CausalLMOutput,
     BaseModelOutputWithPast,
+    CausalLMOutput,
     ModelOutput,
 )
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.models.auto import AutoModel, AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.utils import logging
 
-
-from .tokenizer import (
-    KugelAudioAcousticTokenizerModel,
-    KugelAudioSemanticTokenizerModel,
-)
-from .diffusion_head import KugelAudioDiffusionHead
-from ..schedule.dpm_solver import DPMSolverMultistepScheduler
-
 from ..configs import KugelAudioConfig
-
+from ..schedule.dpm_solver import DPMSolverMultistepScheduler
+from .diffusion_head import KugelAudioDiffusionHead
+from .tokenizer import KugelAudioAcousticTokenizerModel
 
 logger = logging.get_logger(__name__)
 
-if (
-    not hasattr(modeling_utils, "ALL_PARALLEL_STYLES")
-    or modeling_utils.ALL_PARALLEL_STYLES is None
-):
+if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
 
 
@@ -137,19 +127,14 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
         lm_config = config.decoder_config
         self.language_model = AutoModel.from_config(lm_config)
 
-        # Initialize speech components if needed
-        self.acoustic_tokenizer = AutoModel.from_config(
-            config.acoustic_tokenizer_config
-        ).to(dtype)
-        self.semantic_tokenizer = AutoModel.from_config(
-            config.semantic_tokenizer_config
-        ).to(dtype)
+        # Acoustic tokenizer: only the decoder is needed for inference (latent -> audio).
+        # The encoder weights are loaded from the checkpoint for compatibility but
+        # deleted immediately to save VRAM.
+        self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)
 
+        # Connector for pre-encoded voice embeddings -> LM hidden space
         self.acoustic_connector = SpeechConnector(
             config.acoustic_vae_dim, lm_config.hidden_size
-        ).to(dtype)
-        self.semantic_connector = SpeechConnector(
-            config.semantic_vae_dim, lm_config.hidden_size
         ).to(dtype)
 
         # Register scaling factors as buffers - use 1D tensors for FSDP compatibility
@@ -157,9 +142,7 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
         self.register_buffer("speech_bias_factor", torch.tensor(float("nan")))
 
         # Initialize prediction head for speech generation
-        self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(
-            dtype
-        )
+        self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(dtype)
 
         # Initialize noise scheduler with SDE-DPM-Solver++ for better quality
         algorithm_type = getattr(
@@ -173,6 +156,21 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
             solver_order=2,
         )
 
+    def strip_encoders(self):
+        """Remove encoder weights from acoustic tokenizer to free VRAM.
+
+        Call this after loading the model to remove encoder components
+        that are not needed for inference with pre-encoded voices.
+        The acoustic decoder (for latent -> waveform) is kept.
+        """
+        if hasattr(self.acoustic_tokenizer, "encoder"):
+            del self.acoustic_tokenizer.encoder
+            self.acoustic_tokenizer.encoder = None
+
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def get_input_embeddings(self):
         if hasattr(self.language_model, "embed_tokens"):
             # If the language model has an embed_tokens attribute, return it
@@ -181,27 +179,13 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
         for (
             name,
             attr,
-        ) in (
-            self.language_model.fullmap.items()
-        ):  # parallel by nnscaler, the name is changed
+        ) in self.language_model.fullmap.items():  # parallel by nnscaler, the name is changed
             if attr.orig_name == "embed_tokens.weight":
                 return getattr(self.language_model, name)
         assert False, "should not arrive here"
 
     def set_input_embeddings(self, value):
         self.language_model.embed_tokens = value
-
-    def set_speech_tokenizers(self, acoustic_tokenizer=None, semantic_tokenizer=None):
-        """Set the speech tokenizers used for encoding and decoding speech."""
-        self.acoustic_tokenizer = acoustic_tokenizer
-        self.semantic_tokenizer = semantic_tokenizer
-
-        # Reset the encoder to evaluation mode
-        if self.acoustic_tokenizer is not None:
-            self.acoustic_tokenizer.eval()
-
-        if self.semantic_tokenizer is not None:
-            self.semantic_tokenizer.eval()
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
@@ -218,19 +202,19 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
     ) -> torch.Tensor:
         """
         Creates a 4D causal attention mask for use with static cache.
-        
+
         This enables torch.compile to work efficiently without recompilation
         by providing a consistent mask shape during autoregressive generation.
-        
+
         Based on the standard HuggingFace implementation without sliding window
         (KugelAudio doesn't use sliding window attention).
-        
+
         Compatible with both old and new transformers API.
         """
         # Handle case where attention_mask is already 4D
         if attention_mask is not None and attention_mask.dim() == 4:
             return attention_mask
-        
+
         # Get device from attention_mask or cache_position if not provided
         if device is None:
             if attention_mask is not None:
@@ -239,9 +223,9 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
                 device = cache_position.device
             else:
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         min_dtype = torch.finfo(dtype).min
-        
+
         # Create causal mask: (sequence_length, target_length)
         causal_mask = torch.full(
             (sequence_length, target_length),
@@ -249,29 +233,34 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
             dtype=dtype,
             device=device,
         )
-        
+
         if sequence_length != 1:
             # Apply upper triangular mask (can't attend to future tokens)
             causal_mask = torch.triu(causal_mask, diagonal=1)
-        
+
         # Mask positions beyond current cache position
         if cache_position is not None:
-            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-        
+            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(
+                -1, 1
+            )
+
         # Expand to 4D: (batch_size, 1, sequence_length, target_length)
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-        
+
         # Combine with input attention mask if provided
         if attention_mask is not None:
             causal_mask = causal_mask.clone()
             mask_length = attention_mask.shape[-1]
             # Create padding mask from attention_mask
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(dtype) * min_dtype
+            padding_mask = (
+                causal_mask[:, :, :, :mask_length]
+                + attention_mask[:, None, None, :].to(dtype) * min_dtype
+            )
             padding_mask = padding_mask == 0
             causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                 padding_mask, min_dtype
             )
-        
+
         return causal_mask
 
     def forward(
@@ -289,9 +278,7 @@ class KugelAudioModel(KugelAudioPreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # Forward through language model
         outputs = self.language_model(
@@ -335,9 +322,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
         super().__init__(config)
         self.model = KugelAudioModel(config)
         self.vocab_size = config.decoder_config.vocab_size
-        self.lm_head = nn.Linear(
-            config.decoder_config.hidden_size, self.vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.decoder_config.hidden_size, self.vocab_size, bias=False)
 
         # Inference configuration (for generate() method)
         self.ddpm_inference_steps = (
@@ -393,8 +378,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                     output_embeddings.bias.data,
                     (
                         0,
-                        output_embeddings.weight.shape[0]
-                        - output_embeddings.bias.shape[0],
+                        output_embeddings.weight.shape[0] - output_embeddings.bias.shape[0],
                     ),
                     "constant",
                     0,
@@ -420,9 +404,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
         if speech_tensors is None:
             # Use config to get vae_dim instead of non-existent self.args
             vae_dim = self.config.acoustic_tokenizer_config.vae_dim
-            audio_features = torch.zeros(1, 1, vae_dim).to(
-                self.get_input_embeddings().weight
-            )
+            audio_features = torch.zeros(1, 1, vae_dim).to(self.get_input_embeddings().weight)
             connect_features = self.model.acoustic_connector(audio_features)
             return audio_features, connect_features
         else:
@@ -436,16 +418,12 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                             frames = frames_out[0][0]
                         else:
                             frames = frames_out
-                    audio_tokens = frames.sample(
-                        self.model.acoustic_tokenizer.std_dist_type
-                    )[0]
+                    audio_tokens = frames.sample(self.model.acoustic_tokenizer.std_dist_type)[0]
 
                 elif speech_type == "vae":
                     # Use config to get vae_dim instead of non-existent self.args
                     vae_dim = self.config.acoustic_tokenizer_config.vae_dim
-                    speech_mode = speech_tensors.reshape(
-                        speech_tensors.size(0), -1, vae_dim
-                    )
+                    speech_mode = speech_tensors.reshape(speech_tensors.size(0), -1, vae_dim)
 
                     # gaussian sample from the speech_mode
                     batch_size = speech_mode.size(0)
@@ -459,13 +437,11 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                         * value
                     )
                     std = std.view(-1, *[1] * (speech_mode.dim() - 1))
-                    audio_tokens = speech_mode + std * torch.randn(
-                        speech_mode.shape
-                    ).to(speech_mode)
-                else:
-                    raise NotImplementedError(
-                        f"Speech type {speech_type} not implemented"
+                    audio_tokens = speech_mode + std * torch.randn(speech_mode.shape).to(
+                        speech_mode
                     )
+                else:
+                    raise NotImplementedError(f"Speech type {speech_type} not implemented")
 
                 if torch.isnan(self.model.speech_scaling_factor) or torch.isnan(
                     self.model.speech_bias_factor
@@ -478,9 +454,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                         dist.all_reduce(scaling_factor, op=dist.ReduceOp.SUM)
                         dist.all_reduce(bias_factor, op=dist.ReduceOp.SUM)
                         world_size = dist.get_world_size()
-                        self.model.speech_scaling_factor.copy_(
-                            scaling_factor / world_size
-                        )
+                        self.model.speech_scaling_factor.copy_(scaling_factor / world_size)
                         self.model.speech_bias_factor.copy_(bias_factor / world_size)
                         print(
                             f"Speech scaling factor (distributed): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}",
@@ -521,44 +495,30 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
         speech_tensors: Optional[torch.FloatTensor] = None,
         speech_masks: Optional[torch.BoolTensor] = None,
         speeches_loss_input: Optional[torch.FloatTensor] = None,
-        speech_semantic_tensors: Optional[torch.FloatTensor] = None,
+        speech_semantic_tensors: Optional[
+            torch.FloatTensor
+        ] = None,  # Kept for backward compat (ignored)
         acoustic_input_mask: Optional[torch.BoolTensor] = None,
         acoustic_loss_mask: Optional[torch.BoolTensor] = None,
         ddpm_batch_mul: int = 1,
         **kwargs: Optional[Dict[str, Union[torch.Tensor, str]]],
     ) -> Union[Tuple, KugelAudioCausalLMOutputWithPast]:
 
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         x = self.get_input_embeddings()(input_ids)
 
-        semantic_speech_all_connect_features = self.model.semantic_connector(
-            speech_semantic_tensors
-        )
+        # Semantic connector removed – only acoustic features are used now
         if speeches_loss_input is not None:
             # only part audio need diffuse
-            speech_all_features, speech_all_connect_features = (
-                self.forward_speech_features(
-                    speech_tensors=(
-                        speech_tensors.type_as(x)
-                        if speech_tensors is not None
-                        else None
-                    ),
-                    speech_masks=speech_masks,
-                    speech_type=kwargs.get("speech_type", "audio"),
-                    return_unmask=True,
-                )
+            speech_all_features, speech_all_connect_features = self.forward_speech_features(
+                speech_tensors=(speech_tensors.type_as(x) if speech_tensors is not None else None),
+                speech_masks=speech_masks,
+                speech_type=kwargs.get("speech_type", "audio"),
+                return_unmask=True,
             )
             if speech_tensors is not None:
-                if semantic_speech_all_connect_features is not None:
-                    x[acoustic_input_mask] = (
-                        speech_all_connect_features[speech_masks]
-                        + semantic_speech_all_connect_features[speech_masks]
-                    )
-                else:
-                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
+                x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
                 speech_features = speech_all_features[
                     speeches_loss_input & speech_masks
                 ]  # only part audio need diffuse
@@ -575,9 +535,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                     pass
         else:
             speech_features, speech_connect_features = self.forward_speech_features(
-                speech_tensors=(
-                    speech_tensors.type_as(x) if speech_tensors is not None else None
-                ),
+                speech_tensors=(speech_tensors.type_as(x) if speech_tensors is not None else None),
                 speech_masks=speech_masks,
                 speech_type=kwargs.get("speech_type", "audio"),
             )
@@ -638,9 +596,7 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                 replacement=True,
             ).to(hidden_states.device)
 
-            speech_features_repeated = speech_features.repeat_interleave(
-                ddpm_batch_mul, dim=0
-            )
+            speech_features_repeated = speech_features.repeat_interleave(ddpm_batch_mul, dim=0)
             condition_features_repeated = condition_features.repeat_interleave(
                 ddpm_batch_mul, dim=0
             )
@@ -661,33 +617,22 @@ class KugelAudioForConditionalGeneration(KugelAudioPreTrainedModel):
                     speech_features_repeated, noise, timesteps
                 )
             else:
-                raise NotImplementedError(
-                    f"Prediction type {prediction_type} not implemented"
-                )
+                raise NotImplementedError(f"Prediction type {prediction_type} not implemented")
 
             diffusion_loss = F.mse_loss(
                 model_output.float(), target_for_loss.float(), reduction="sum"
             )
             if latent_size > 0 and ddpm_batch_mul > 0:
                 # Normalize by latent dim, number of sampled diffusion steps per latent, and number of speech tokens
-                diffusion_loss = (
-                    diffusion_loss / latent_size / ddpm_batch_mul / max(speech_len, 1)
-                )
+                diffusion_loss = diffusion_loss / latent_size / ddpm_batch_mul / max(speech_len, 1)
             else:
                 diffusion_loss = torch.tensor(0.0, device=diffusion_loss.device)
 
         else:
             # Dummy loss for DDP to work when there are no speech samples in a batch,
             # but we are in a speech context.
-            diffusion_loss = (
-                sum(p.sum() for p in self.model.prediction_head.parameters()) * 0.0
-            )
-            diffusion_loss += (
-                sum(p.sum() for p in self.model.acoustic_connector.parameters()) * 0.0
-            )
-            diffusion_loss += (
-                sum(p.sum() for p in self.model.semantic_connector.parameters()) * 0.0
-            )
+            diffusion_loss = sum(p.sum() for p in self.model.prediction_head.parameters()) * 0.0
+            diffusion_loss += sum(p.sum() for p in self.model.acoustic_connector.parameters()) * 0.0
         # --- End Diffusion Loss Calculation ---
 
         if not return_dict:

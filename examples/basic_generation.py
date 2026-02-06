@@ -2,9 +2,12 @@
 """Basic example of generating speech with KugelAudio.
 
 All generated audio is automatically watermarked for identification.
+Voice cloning is not supported. Use pre-encoded voices from the
+voices.json registry instead.
 """
 
 import torch
+
 from kugelaudio_open import (
     AudioWatermark,
     KugelAudioForConditionalGenerationInference,
@@ -27,14 +30,21 @@ def main():
     ).to(device)
     model.eval()
 
+    # Strip encoder weights to save VRAM (only decoders needed for inference)
+    model.model.strip_encoders()
+
     processor = KugelAudioProcessor.from_pretrained(model_id)
+
+    # Show available pre-encoded voices
+    voices = processor.get_available_voices()
+    print(f"Available voices: {voices}")
 
     # Text to synthesize
     text = "Hello! This is a demonstration of KugelAudio text-to-speech synthesis."
 
     print(f"Generating speech for: '{text}'")
 
-    # Process input
+    # Process input (optionally pass voice="default" to use a pre-encoded voice)
     inputs = processor(text=text, return_tensors="pt")
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 

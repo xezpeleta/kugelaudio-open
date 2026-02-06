@@ -1,7 +1,7 @@
 <h1 align="center">🎙️ KugelAudio</h1>
 
 <p align="center">
-  <strong>Open-source text-to-speech for European languages with voice cloning capabilities</strong><br>
+  <strong>Open-source text-to-speech for European languages</strong><br>
   Powered by an AR + Diffusion architecture
 </p>
 
@@ -90,7 +90,7 @@ Listen to KugelAudio's diverse voice capabilities across different speaking styl
 | **Angry Voice** | Irritated and frustrated speech | <audio controls><source src="https://huggingface.co/kugelaudio/kugelaudio-0-open/resolve/main/samples/261_Sauerer_Felix.wav" type="audio/wav"></audio> |
 | **Radio Announcer** | Professional radio broadcast voice | <audio controls><source src="https://huggingface.co/kugelaudio/kugelaudio-0-open/resolve/main/samples/277_Radio_Lars.wav" type="audio/wav"></audio> |
 
-*All samples are generated with zero-shot voice cloning from reference audio.*
+*All samples are generated using pre-encoded voice embeddings.*
 
 ### Training Details
 
@@ -124,7 +124,7 @@ Get started with KugelAudio quickly using our documentation:
 |---|---|
 | 📥 [**Installation**](#installation) | Set up KugelAudio on your machine |
 | 🎯 [**Quick Start**](#quick-start) | Generate your first speech in minutes |
-| 🎭 [**Voice Cloning**](#voice-cloning) | Clone any voice with reference audio |
+| 🎭 [**Voices**](#voices) | Use pre-encoded voices for different speakers |
 | ☁️ [**Hosted API**](#hosted-api) | Use our cloud API for zero-setup inference |
 | 🔒 [**Watermarking**](#audio-watermarking) | Verify AI-generated audio |
 | 📦 [**Models**](#models) | Available model variants and benchmarks |
@@ -136,7 +136,7 @@ Get started with KugelAudio quickly using our documentation:
 - 🏆 **State-of-the-Art Performance**: Outperforms ElevenLabs and other leading TTS models in human evaluations
 - 🌍 **European Language Focus**: Trained specifically for 24 major European languages
 - **High-Quality TTS**: State-of-the-art speech synthesis using AR + Diffusion
-- **Voice Cloning**: Clone any voice with just a few seconds of reference audio
+- 🎭 **Pre-encoded Voices**: Select from a set of pre-encoded speaker voices
 - **Audio Watermarking**: All generated audio is watermarked using [Facebook's AudioSeal](https://huggingface.co/facebook/audioseal)
 - 🎭 **Emotional Range**: Supports various speaking styles including shouting, singing, and expressive speech
 - **Web Interface**: Easy-to-use Gradio UI for non-technical users
@@ -200,8 +200,8 @@ Then open http://127.0.0.1:7860 in your browser.
 # Generate speech from text
 uv run python start.py generate "Hello, this is KugelAudio!" -o hello.wav
 
-# With voice cloning
-uv run python start.py generate "Hello in your voice!" -r reference.wav -o cloned.wav
+# With a specific pre-encoded voice
+uv run python start.py generate "Hello in a warm voice!" --voice warm -o warm.wav
 
 # Using the default model for higher quality
 uv run python start.py generate "Premium quality speech" --model kugelaudio/kugelaudio-0-open -o premium.wav
@@ -227,10 +227,16 @@ model = KugelAudioForConditionalGenerationInference.from_pretrained(
 ).to(device)
 model.eval()
 
+# Strip encoder weights to save VRAM (only decoders needed for inference)
+model.model.strip_encoders()
+
 processor = KugelAudioProcessor.from_pretrained("kugelaudio/kugelaudio-0-open")
 
+# See available voices
+print(processor.get_available_voices())  # ["default", "warm", "clear"]
+
 # Generate speech (watermark is automatically applied)
-inputs = processor(text="Hello world!", return_tensors="pt")
+inputs = processor(text="Hello world!", voice="default", return_tensors="pt")
 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 with torch.no_grad():
@@ -240,23 +246,26 @@ with torch.no_grad():
 processor.save_audio(outputs.speech_outputs[0], "output.wav")
 ```
 
-### Voice Cloning
+### Voices
+
+KugelAudio provides pre-encoded voices that can be selected by name. The voices are stored as `.pt` files in the model repository and are automatically downloaded from HuggingFace when needed.
 
 ```python
-# Process text with voice prompt for cloning
-inputs = processor(
-    text="Hello world!",
-    voice_prompt="reference_voice.wav",  # Path to reference audio
-    return_tensors="pt"
-)
+# List available voices
+voices = processor.get_available_voices()
+print(voices)  # ["default", "warm", "clear"]
+
+# Generate with a specific voice
+inputs = processor(text="Hello world!", voice="warm", return_tensors="pt")
 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-# Generate with cloned voice (watermark is automatically applied)
 with torch.no_grad():
     outputs = model.generate(**inputs, cfg_scale=3.0)
 
-processor.save_audio(outputs.speech_outputs[0], "cloned_output.wav")
+processor.save_audio(outputs.speech_outputs[0], "warm_voice_output.wav")
 ```
+
+> **Note:** Voice cloning from raw audio is not supported in this open-source release. Only the pre-encoded voices listed in `voices/voices.json` are available.
 
 ## Hosted API
 
@@ -351,7 +360,6 @@ export TORCH_ALLOW_TF32=1
 ```python
 outputs = model.generate(
     **inputs,
-    voice_prompt=voice_prompt,      # Reference audio for voice cloning
     cfg_scale=3.0,                  # Guidance scale (1.0-10.0)
     max_new_tokens=4096,            # Maximum generation length
 )
@@ -411,7 +419,7 @@ This model would not have been possible without the contributions of many indivi
 
 ```bibtex
 @software{kugelaudio2026,
-  title = {KugelAudio: Open-Source Text-to-Speech for European Languages with Voice Cloning},
+  title = {KugelAudio: Open-Source Text-to-Speech for European Languages},
   author = {Kratzenstein, Kajo and Menke, Carlos},
   year = {2026},
   institution = {Hasso-Plattner-Institut},

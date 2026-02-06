@@ -1,6 +1,7 @@
 """Configuration classes for KugelAudio models."""
 
-from typing import Optional, List, Union
+from typing import List, Optional, Union
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.utils import logging
@@ -10,11 +11,11 @@ logger = logging.get_logger(__name__)
 
 class KugelAudioAcousticTokenizerConfig(PretrainedConfig):
     """Configuration for the acoustic tokenizer.
-    
+
     The acoustic tokenizer converts continuous speech latents back to audio waveforms.
     It uses a hierarchical convolutional architecture with multiple upsampling stages.
     """
-    
+
     model_type = "kugelaudio_acoustic_tokenizer"
 
     def __init__(
@@ -79,10 +80,10 @@ class KugelAudioAcousticTokenizerConfig(PretrainedConfig):
 
 class KugelAudioSemanticTokenizerConfig(PretrainedConfig):
     """Configuration for the semantic tokenizer.
-    
+
     The semantic tokenizer extracts semantic features from audio for conditioning.
     """
-    
+
     model_type = "kugelaudio_semantic_tokenizer"
 
     def __init__(
@@ -138,11 +139,11 @@ class KugelAudioSemanticTokenizerConfig(PretrainedConfig):
 
 class KugelAudioDiffusionHeadConfig(PretrainedConfig):
     """Configuration for the diffusion prediction head.
-    
+
     The diffusion head predicts speech latents from text-conditioned hidden states
     using a denoising diffusion process.
     """
-    
+
     model_type = "kugelaudio_diffusion_head"
 
     def __init__(
@@ -181,28 +182,30 @@ class KugelAudioDiffusionHeadConfig(PretrainedConfig):
 
 class KugelAudioConfig(PretrainedConfig):
     """Main configuration for KugelAudio TTS model.
-    
+
     This configuration combines:
     - A language model backbone (Qwen2) for text understanding
-    - An acoustic tokenizer for audio encoding/decoding
-    - A semantic tokenizer for semantic feature extraction
+    - An acoustic tokenizer for audio decoding (latents -> waveform)
     - A diffusion head for speech latent prediction
-    
+
+    Note:
+        Voice cloning is not supported. Use pre-encoded voices from the
+        voices/ directory on HuggingFace instead.
+
     Example:
         >>> from kugelaudio import KugelAudioConfig
         >>> config = KugelAudioConfig.from_pretrained("kugelaudio/kugelaudio-0-open")
     """
-    
+
     model_type = "kugelaudio"
     is_composition = True
-    
+
     sub_configs = {
         "acoustic_tokenizer_config": KugelAudioAcousticTokenizerConfig,
-        "semantic_tokenizer_config": KugelAudioSemanticTokenizerConfig,
         "decoder_config": Qwen2Config,
         "diffusion_head_config": KugelAudioDiffusionHeadConfig,
     }
-    
+
     # Tensor parallel plan for distributed inference
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
@@ -217,7 +220,7 @@ class KugelAudioConfig(PretrainedConfig):
     def __init__(
         self,
         acoustic_tokenizer_config=None,
-        semantic_tokenizer_config=None,
+        semantic_tokenizer_config=None,  # Kept for backward compat (ignored)
         decoder_config=None,
         diffusion_head_config=None,
         **kwargs,
@@ -230,18 +233,14 @@ class KugelAudioConfig(PretrainedConfig):
             self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"]()
         elif isinstance(acoustic_tokenizer_config, dict):
             acoustic_tokenizer_config["model_type"] = "kugelaudio_acoustic_tokenizer"
-            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"](**acoustic_tokenizer_config)
+            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"](
+                **acoustic_tokenizer_config
+            )
         elif isinstance(acoustic_tokenizer_config, KugelAudioAcousticTokenizerConfig):
             self.acoustic_tokenizer_config = acoustic_tokenizer_config
 
-        # Initialize semantic tokenizer config
-        if semantic_tokenizer_config is None:
-            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"]()
-        elif isinstance(semantic_tokenizer_config, dict):
-            semantic_tokenizer_config["model_type"] = "kugelaudio_semantic_tokenizer"
-            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"](**semantic_tokenizer_config)
-        elif isinstance(semantic_tokenizer_config, KugelAudioSemanticTokenizerConfig):
-            self.semantic_tokenizer_config = semantic_tokenizer_config
+        # semantic_tokenizer_config is accepted but ignored (backward compat)
+        # Voices are now pre-encoded and loaded from HuggingFace
 
         # Initialize decoder (language model) config
         if decoder_config is None:
@@ -261,13 +260,14 @@ class KugelAudioConfig(PretrainedConfig):
             self.diffusion_head_config = self.sub_configs["diffusion_head_config"]()
         elif isinstance(diffusion_head_config, dict):
             diffusion_head_config["model_type"] = "kugelaudio_diffusion_head"
-            self.diffusion_head_config = self.sub_configs["diffusion_head_config"](**diffusion_head_config)
+            self.diffusion_head_config = self.sub_configs["diffusion_head_config"](
+                **diffusion_head_config
+            )
         elif isinstance(diffusion_head_config, KugelAudioDiffusionHeadConfig):
             self.diffusion_head_config = diffusion_head_config
 
         # Derived parameters
         self.acoustic_vae_dim = self.acoustic_tokenizer_config.vae_dim
-        self.semantic_vae_dim = self.semantic_tokenizer_config.vae_dim
 
         super().__init__(**kwargs)
 
@@ -280,7 +280,7 @@ DiffusionHeadConfig = KugelAudioDiffusionHeadConfig
 
 __all__ = [
     "KugelAudioAcousticTokenizerConfig",
-    "KugelAudioSemanticTokenizerConfig", 
+    "KugelAudioSemanticTokenizerConfig",
     "KugelAudioDiffusionHeadConfig",
     "KugelAudioConfig",
     # Aliases

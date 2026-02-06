@@ -7,13 +7,14 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from kugelaudio_open.processors.audio_processor import AudioNormalizer, AudioProcessor
 from transformers.tokenization_utils_base import (
     BatchEncoding,
     PaddingStrategy,
     TruncationStrategy,
 )
 from transformers.utils import TensorType, cached_file, logging
+
+from kugelaudio_open.processors.audio_processor import AudioNormalizer, AudioProcessor
 
 logger = logging.get_logger(__name__)
 
@@ -24,9 +25,12 @@ class KugelAudioProcessor:
     Wraps a text tokenizer and audio processor into a single interface
     for preparing inputs for KugelAudio models.
 
+    Voice cloning from raw audio is not supported. Instead, pre-encoded
+    voices are loaded from .pt files referenced in a voices.json registry.
+
     Example:
         >>> processor = KugelAudioProcessor.from_pretrained("kugelaudio/kugelaudio-0-open")
-        >>> inputs = processor(text="Hello world", voice_prompt=voice_audio)
+        >>> inputs = processor(text="Hello world", voice="default")
     """
 
     def __init__(
@@ -35,6 +39,9 @@ class KugelAudioProcessor:
         audio_processor: Optional[AudioProcessor] = None,
         speech_compression_ratio: int = 3200,
         db_normalize: bool = True,
+        voices_registry: Optional[Dict[str, Any]] = None,
+        voices_dir: Optional[str] = None,
+        model_name_or_path: Optional[str] = None,
         **kwargs,
     ):
         self.tokenizer = tokenizer
@@ -42,6 +49,9 @@ class KugelAudioProcessor:
         self.speech_compression_ratio = speech_compression_ratio
         self.db_normalize = db_normalize
         self.audio_normalizer = AudioNormalizer() if db_normalize else None
+        self.voices_registry = voices_registry or {}
+        self.voices_dir = voices_dir
+        self._model_name_or_path = model_name_or_path
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
@@ -98,11 +108,34 @@ class KugelAudioProcessor:
         else:
             audio_processor = AudioProcessor()
 
+        # Load voices registry (voices.json)
+        voices_registry = {}
+        voices_dir = None
+        voices_json_path = os.path.join(pretrained_model_name_or_path, "voices", "voices.json")
+        if os.path.exists(voices_json_path):
+            with open(voices_json_path, "r") as f:
+                voices_registry = json.load(f)
+            voices_dir = os.path.join(pretrained_model_name_or_path, "voices")
+        else:
+            try:
+                voices_file = cached_file(
+                    pretrained_model_name_or_path, "voices/voices.json", **kwargs
+                )
+                if voices_file:
+                    with open(voices_file, "r") as f:
+                        voices_registry = json.load(f)
+                    voices_dir = os.path.dirname(voices_file)
+            except Exception:
+                logger.warning("No voices.json found. Pre-encoded voices will not be available.")
+
         return cls(
             tokenizer=tokenizer,
             audio_processor=audio_processor,
             speech_compression_ratio=speech_compression_ratio,
             db_normalize=db_normalize,
+            voices_registry=voices_registry,
+            voices_dir=voices_dir,
+            model_name_or_path=pretrained_model_name_or_path,
         )
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], **kwargs):
@@ -127,28 +160,92 @@ class KugelAudioProcessor:
 
         logger.info(f"Processor saved to {config_path}")
 
+    def get_available_voices(self) -> List[str]:
+        """Return list of available pre-encoded voice names."""
+        return list(self.voices_registry.keys())
+
+    def load_voice_cache(self, voice_name: str) -> dict:
+        """Load a pre-encoded voice by name from the voices registry.
+
+        Supports loading from local directories and from HuggingFace Hub
+        repositories. When the model was loaded from a HuggingFace repo,
+        individual .pt voice files are downloaded automatically on demand.
+
+        Args:
+            voice_name: Name of the voice (must be in voices.json registry).
+
+        Returns:
+            Dict with "acoustic_mean" tensor, suitable for passing as voice_cache.
+
+        Raises:
+            ValueError: If voice_name is not found in the registry.
+        """
+        if voice_name not in self.voices_registry:
+            available = ", ".join(self.voices_registry.keys()) or "(none)"
+            raise ValueError(f"Voice '{voice_name}' not found. Available voices: {available}")
+
+        voice_info = self.voices_registry[voice_name]
+        voice_file = voice_info["file"]
+        voice_path = None
+
+        # Strategy 1: Try local voices_dir (works for local model paths)
+        if self.voices_dir:
+            candidate = os.path.join(self.voices_dir, voice_file)
+            if os.path.exists(candidate):
+                voice_path = candidate
+
+        # Strategy 2: Download from HuggingFace Hub if not found locally
+        if voice_path is None and self._model_name_or_path:
+            try:
+                voice_path = cached_file(
+                    self._model_name_or_path,
+                    f"voices/{voice_file}",
+                )
+            except Exception as e:
+                logger.warning(f"Could not download voice file 'voices/{voice_file}' from hub: {e}")
+
+        if voice_path is None:
+            raise ValueError(
+                f"Could not find voice file '{voice_file}' for voice '{voice_name}'. "
+                f"Checked local dir: {self.voices_dir}, "
+                f"HuggingFace repo: {self._model_name_or_path}"
+            )
+
+        voice_cache = torch.load(voice_path, map_location="cpu", weights_only=True)
+        if "acoustic_mean" not in voice_cache:
+            raise ValueError(
+                f"Voice file '{voice_file}' does not contain 'acoustic_mean'. "
+                f"Available keys: {list(voice_cache.keys())}"
+            )
+        return voice_cache
+
     def __call__(
         self,
         text: Optional[str] = None,
-        voice_prompt: Optional[Union[np.ndarray, torch.Tensor, str]] = None,
+        voice: Optional[str] = None,
+        voice_cache: Optional[dict] = None,
         padding: Union[bool, str, PaddingStrategy] = True,
         truncation: Union[bool, str, TruncationStrategy] = False,
         max_length: Optional[int] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
         **kwargs,
     ) -> BatchEncoding:
-        """Process text and optional voice prompt.
+        """Process text and optional pre-encoded voice.
+
+        Voice cloning from raw audio is no longer supported. Use a pre-encoded
+        voice name or provide a voice_cache dict directly.
 
         Args:
             text: Input text to synthesize
-            voice_prompt: Voice prompt audio for speaker identity (raw audio tensor or path)
+            voice: Name of a pre-encoded voice (from voices.json registry)
+            voice_cache: Pre-encoded voice features dict (alternative to voice name)
             padding: Padding strategy
             truncation: Truncation strategy
             max_length: Maximum sequence length
             return_tensors: Return format
 
         Returns:
-            BatchEncoding with processed inputs including speech_input_mask for voice cloning
+            BatchEncoding with processed inputs including speech_input_mask and voice_cache
         """
         if text is None:
             raise ValueError("Text input is required")
@@ -158,77 +255,74 @@ class KugelAudioProcessor:
         speech_diffusion_id = 151654  # VAE token used as placeholder
 
         # Format text with proper template
-        # Add speaker prefix if not present (use Speaker 0 to match training format)
         formatted_text = text.strip()
         if not formatted_text.startswith("Speaker"):
             formatted_text = f"Speaker 0: {formatted_text}"
 
         # Build the full prompt template matching the training format
         system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
-        
+
         # Start building tokens and speech_input_mask
         full_tokens = []
         speech_input_mask = []
-        voice_audio = None
-        
+
         # System prompt tokens
         system_tokens = self.tokenizer.encode(system_prompt, add_special_tokens=False)
         full_tokens.extend(system_tokens)
         speech_input_mask.extend([False] * len(system_tokens))
-        
-        # Process voice prompt if provided
-        if voice_prompt is not None:
-            # Load audio if it's a path
-            if isinstance(voice_prompt, str):
-                voice_audio = self.audio_processor._load_from_path(voice_prompt)
-                if self.db_normalize and self.audio_normalizer:
-                    voice_audio = self.audio_normalizer(voice_audio)
-            elif isinstance(voice_prompt, np.ndarray):
-                voice_audio = voice_prompt.astype(np.float32)
-            elif isinstance(voice_prompt, torch.Tensor):
-                voice_audio = voice_prompt.cpu().numpy()
-                if voice_audio.ndim > 1:
-                    voice_audio = voice_audio.squeeze()
-                voice_audio = voice_audio.astype(np.float32)
-            
+
+        # Load voice cache from registry if voice name is provided
+        loaded_voice_cache = voice_cache
+        if voice is not None and voice_cache is None:
+            loaded_voice_cache = self.load_voice_cache(voice)
+
+        # Process pre-encoded voice if available
+        if loaded_voice_cache is not None:
+            acoustic_mean = loaded_voice_cache["acoustic_mean"]
+            # Number of tokens is determined by the acoustic_mean time dimension
+            if acoustic_mean.dim() == 3:
+                num_voice_tokens = acoustic_mean.shape[1]
+            elif acoustic_mean.dim() == 2:
+                num_voice_tokens = acoustic_mean.shape[0]
+            else:
+                num_voice_tokens = 1
+
             # Voice input section with placeholder tokens
             voice_input_tokens = self.tokenizer.encode(" Voice input:\n", add_special_tokens=False)
             full_tokens.extend(voice_input_tokens)
             speech_input_mask.extend([False] * len(voice_input_tokens))
-            
+
             # Speaker prefix for voice
             speaker_prefix = self.tokenizer.encode(" Speaker 0:", add_special_tokens=False)
             full_tokens.extend(speaker_prefix)
             speech_input_mask.extend([False] * len(speaker_prefix))
-            
-            # Calculate number of VAE tokens needed based on audio length
-            # compression ratio is typically 3200 samples per token at 24kHz
-            num_voice_tokens = math.ceil(len(voice_audio) / self.speech_compression_ratio)
-            
+
             # Add placeholder VAE tokens that will be replaced with speech embeddings
             full_tokens.extend([speech_diffusion_id] * num_voice_tokens)
-            speech_input_mask.extend([True] * num_voice_tokens)  # These positions get speech embeddings
-            
+            speech_input_mask.extend([True] * num_voice_tokens)
+
             # Newline after voice
             newline_tokens = self.tokenizer.encode("\n", add_special_tokens=False)
             full_tokens.extend(newline_tokens)
             speech_input_mask.extend([False] * len(newline_tokens))
-        
+
         # Text input section
         text_input_tokens = self.tokenizer.encode(" Text input:\n", add_special_tokens=False)
         full_tokens.extend(text_input_tokens)
         speech_input_mask.extend([False] * len(text_input_tokens))
-        
+
         # Speaker text
-        speaker_text_tokens = self.tokenizer.encode(f" {formatted_text}\n", add_special_tokens=False)
+        speaker_text_tokens = self.tokenizer.encode(
+            f" {formatted_text}\n", add_special_tokens=False
+        )
         full_tokens.extend(speaker_text_tokens)
         speech_input_mask.extend([False] * len(speaker_text_tokens))
-        
+
         # Speech output section
         speech_output_tokens = self.tokenizer.encode(" Speech output:\n", add_special_tokens=False)
         full_tokens.extend(speech_output_tokens)
         speech_input_mask.extend([False] * len(speech_output_tokens))
-        
+
         # Add speech_start token
         full_tokens.append(speech_start_id)
         speech_input_mask.append(False)
@@ -241,106 +335,9 @@ class KugelAudioProcessor:
             result["text_ids"] = torch.tensor([full_tokens], dtype=torch.long)
             result["speech_input_mask"] = torch.tensor([speech_input_mask], dtype=torch.bool)
 
-        # Include processed voice audio for the model to encode
-        if voice_audio is not None:
-            if return_tensors == "pt":
-                result["speech_tensors"] = torch.tensor(voice_audio, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-                # Create speech_masks (all True for the voice frames)
-                num_frames = math.ceil(len(voice_audio) / self.speech_compression_ratio)
-                result["speech_masks"] = torch.ones(1, num_frames, dtype=torch.bool)
-            else:
-                result["speech_tensors"] = voice_audio
-                num_frames = math.ceil(len(voice_audio) / self.speech_compression_ratio)
-                result["speech_masks"] = [True] * num_frames
-
-        return result
-
-    def process_with_cached_prompt(
-        self,
-        text: str,
-        cached_prompt: Dict[str, Any],
-        return_tensors: Optional[Union[str, TensorType]] = "pt",
-        **kwargs,
-    ) -> BatchEncoding:
-        """Process text with pre-computed voice prompt cache.
-
-        Args:
-            text: Input text to synthesize
-            cached_prompt: Pre-computed KV cache from voice prompt
-            return_tensors: Return format
-
-        Returns:
-            BatchEncoding ready for generation
-        """
-        script_tokens = self.tokenizer.encode(text.strip() + "\n", add_special_tokens=False)
-
-        lm_length = cached_prompt["lm"]["last_hidden_state"].size(1)
-        tts_lm_length = cached_prompt["tts_lm"]["last_hidden_state"].size(1)
-
-        # Create pseudo input IDs
-        input_ids = [self.tokenizer.pad_id] * lm_length
-        tts_lm_input_ids = [self.tokenizer.pad_id] * tts_lm_length
-        speech_input_mask = [False] * tts_lm_length
-
-        result = BatchEncoding()
-
-        if return_tensors == "pt":
-            result["input_ids"] = torch.tensor([input_ids], dtype=torch.long)
-            result["tts_lm_input_ids"] = torch.tensor([tts_lm_input_ids], dtype=torch.long)
-            result["tts_text_ids"] = torch.tensor([script_tokens], dtype=torch.long)
-            result["attention_mask"] = torch.ones(1, lm_length, dtype=torch.long)
-            result["tts_lm_attention_mask"] = torch.ones(1, tts_lm_length, dtype=torch.long)
-            result["speech_input_mask"] = torch.tensor([speech_input_mask], dtype=torch.bool)
-        else:
-            result["input_ids"] = [input_ids]
-            result["tts_lm_input_ids"] = [tts_lm_input_ids]
-            result["tts_text_ids"] = [script_tokens]
-            result["attention_mask"] = [[1] * lm_length]
-            result["tts_lm_attention_mask"] = [[1] * tts_lm_length]
-            result["speech_input_mask"] = [speech_input_mask]
-
-        return result
-
-    def prepare_speech_inputs(
-        self,
-        speech_inputs: List[np.ndarray],
-        return_tensors: Optional[Union[str, TensorType]] = None,
-        device: Optional[Union[str, torch.device]] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Dict[str, Any]:
-        """Prepare speech inputs for model.
-
-        Args:
-            speech_inputs: List of speech arrays
-            return_tensors: Return format
-            device: Device to place tensors
-            dtype: Data type for tensors
-
-        Returns:
-            Dictionary with padded speeches and masks
-        """
-        if not speech_inputs:
-            return {"padded_speeches": None, "speech_masks": None}
-
-        # Calculate sequence lengths
-        seq_lens = [math.ceil(s.shape[0] / self.speech_compression_ratio) for s in speech_inputs]
-        max_speech_len = max(s.shape[0] for s in speech_inputs)
-
-        # Pad speeches
-        padded = np.zeros((len(speech_inputs), max_speech_len), dtype=np.float32)
-        masks = np.zeros((len(speech_inputs), max(seq_lens)), dtype=np.bool_)
-
-        for i, (speech, seq_len) in enumerate(zip(speech_inputs, seq_lens)):
-            padded[i, : len(speech)] = speech
-            masks[i, :seq_len] = True
-
-        result = {"padded_speeches": padded, "speech_masks": masks}
-
-        if return_tensors == "pt":
-            result["padded_speeches"] = torch.tensor(
-                padded, device=device, dtype=dtype or torch.float32
-            )
-            result["speech_masks"] = torch.tensor(masks, device=device, dtype=torch.bool)
+        # Include voice_cache in the result for the model to use
+        if loaded_voice_cache is not None:
+            result["voice_cache"] = loaded_voice_cache
 
         return result
 

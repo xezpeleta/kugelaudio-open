@@ -110,16 +110,8 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         return self.model.acoustic_tokenizer
 
     @property
-    def semantic_tokenizer(self):
-        return self.model.semantic_tokenizer
-
-    @property
     def acoustic_connector(self):
         return self.model.acoustic_connector
-
-    @property
-    def semantic_connector(self):
-        return self.model.semantic_connector
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -140,11 +132,15 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
 
     def _process_speech_inputs(
         self,
-        speech_tensors: Optional[torch.Tensor],
-        speech_masks: Optional[torch.Tensor],
-        voice_cache: Optional[dict] = None,
+        voice_cache: dict,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process speech inputs through acoustic and semantic encoders.
+        """Process pre-encoded voice features (acoustic only).
+
+        Voice cloning from raw audio is no longer supported. Only pre-encoded
+        voice embeddings (loaded from .pt files) are accepted.
+
+        Args:
+            voice_cache: Dict with "acoustic_mean" tensor and optional "acoustic_std".
 
         Returns:
             Tuple of (acoustic_features, speech_embeds) where speech_embeds has shape
@@ -154,59 +150,17 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
 
-        if voice_cache is not None:
-            # Use pre-encoded voice features
-            acoustic_mean = voice_cache["acoustic_mean"].to(device=device, dtype=dtype)
-            semantic_mean = voice_cache["semantic_mean"].to(device=device, dtype=dtype)
+        # Use pre-encoded voice features (acoustic only)
+        acoustic_mean = voice_cache["acoustic_mean"].to(device=device, dtype=dtype)
 
-            # Sample from acoustic distribution
-            fix_std = voice_cache.get("acoustic_std", self.acoustic_tokenizer.fix_std)
-            acoustic_features = acoustic_mean + fix_std * torch.randn_like(acoustic_mean)
-            semantic_features = semantic_mean
+        # Sample from acoustic distribution
+        fix_std = voice_cache.get("acoustic_std", self.acoustic_tokenizer.fix_std)
+        acoustic_features = acoustic_mean + fix_std * torch.randn_like(acoustic_mean)
 
-            # Create speech_masks from cache dimensions (all frames valid)
-            batch_size = acoustic_features.shape[0]
-            seq_len = acoustic_features.shape[1]
-            speech_masks = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
-
-        elif speech_tensors is not None:
-            # Encode speech through tokenizers
-            with torch.no_grad():
-                # Acoustic encoding
-                if speech_tensors.dim() == 2:
-                    speech_tensors = speech_tensors.unsqueeze(1)
-
-                acoustic_output = self.acoustic_tokenizer.encode(speech_tensors)
-                acoustic_features, _ = self.acoustic_tokenizer.sampling(acoustic_output)
-
-                # Semantic encoding
-                semantic_output = self.semantic_tokenizer.encode(speech_tensors)
-                semantic_features = semantic_output.mean
-
-            # Create speech_masks if not provided (all frames valid)
-            if speech_masks is None:
-                batch_size = acoustic_features.shape[0]
-                seq_len = acoustic_features.shape[1]
-                speech_masks = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
-        else:
-            # Return dummy features
-            vae_dim = self.config.acoustic_vae_dim
-            acoustic_features = torch.zeros(1, 1, vae_dim, device=device, dtype=dtype)
-            semantic_features = torch.zeros(
-                1, 1, self.config.semantic_vae_dim, device=device, dtype=dtype
-            )
-            speech_masks = torch.ones(1, 1, dtype=torch.bool, device=device)
-
-        # Ensure acoustic and semantic have matching time dimensions
-        acoustic_len = acoustic_features.shape[1]
-        semantic_len = semantic_features.shape[1]
-        if semantic_len < acoustic_len:
-            pad_size = acoustic_len - semantic_len
-            semantic_features = torch.nn.functional.pad(
-                semantic_features, (0, 0, 0, pad_size), mode="constant", value=0
-            )
-        elif semantic_len > acoustic_len:
-            semantic_features = semantic_features[:, :acoustic_len, :]
+        # Create speech_masks (all frames valid)
+        batch_size = acoustic_features.shape[0]
+        seq_len = acoustic_features.shape[1]
+        speech_masks = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
 
         # Apply scaling to acoustic features
         if not torch.isnan(self.speech_scaling_factor):
@@ -214,15 +168,11 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                 acoustic_features + self.speech_bias_factor
             ) * self.speech_scaling_factor
 
-        # Get embeddings through connectors
+        # Get embeddings through acoustic connector only
         acoustic_embed = self.acoustic_connector(acoustic_features)
-        semantic_embed = self.semantic_connector(semantic_features)
 
-        # Combine embeddings and index by speech_masks
-        combined_embed = acoustic_embed + semantic_embed
-
-        # Move speech_masks to CPU for indexing (matches working implementation)
-        speech_embeds = combined_embed[speech_masks.cpu()]
+        # Index by speech_masks
+        speech_embeds = acoustic_embed[speech_masks.cpu()]
 
         return acoustic_features, speech_embeds
 
@@ -239,8 +189,6 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        speech_tensors: Optional[torch.FloatTensor] = None,
-        speech_masks: Optional[torch.BoolTensor] = None,
         speech_input_mask: Optional[torch.BoolTensor] = None,
         voice_cache: Optional[dict] = None,
         logits_to_keep: Union[int, slice] = 0,
@@ -252,11 +200,9 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         if inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
-        # Process speech inputs if provided
-        if voice_cache is not None or (speech_tensors is not None and speech_masks is not None):
+        # Process pre-encoded voice features if provided
+        if voice_cache is not None:
             _, speech_embeds = self._process_speech_inputs(
-                speech_tensors.to(self.dtype) if speech_tensors is not None else None,
-                speech_masks,
                 voice_cache=voice_cache,
             )
             if speech_input_mask is not None:
@@ -327,43 +273,11 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         return speech[: len(speech) // 2]
 
     @torch.no_grad()
-    def encode_voice_prompt(
-        self,
-        voice_audio: torch.Tensor,
-        sample_rate: int = 24000,
-    ) -> dict:
-        """Pre-encode a voice prompt for caching."""
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-
-        if voice_audio.dim() == 1:
-            voice_audio = voice_audio.unsqueeze(0).unsqueeze(0)
-        elif voice_audio.dim() == 2:
-            voice_audio = voice_audio.unsqueeze(1)
-
-        voice_audio = voice_audio.to(device=device, dtype=dtype)
-
-        with torch.no_grad():
-            acoustic_output = self.model.acoustic_tokenizer.encode(voice_audio)
-            semantic_output = self.model.semantic_tokenizer.encode(voice_audio)
-
-        return {
-            "acoustic_mean": acoustic_output.mean.cpu(),
-            "acoustic_std": getattr(acoustic_output, "std", self.model.acoustic_tokenizer.fix_std),
-            "semantic_mean": semantic_output.mean.cpu(),
-            "audio_length": voice_audio.shape[-1],
-            "sample_rate": sample_rate,
-        }
-
-    @torch.no_grad()
     def generate(
         self,
         text_ids: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
-        voice_prompt: Optional[torch.Tensor] = None,
         voice_cache: Optional[dict] = None,
-        speech_tensors: Optional[torch.Tensor] = None,
-        speech_masks: Optional[torch.Tensor] = None,
         speech_input_mask: Optional[torch.Tensor] = None,
         cfg_scale: float = 3.0,
         max_new_tokens: int = 2048,
@@ -372,15 +286,15 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         show_progress: bool = True,
         **kwargs,
     ) -> KugelAudioGenerationOutput:
-        """Generate speech from text.
+        """Generate speech from text using a pre-encoded voice.
+
+        Voice cloning from raw audio is no longer supported. Use pre-encoded
+        voice embeddings loaded from .pt files via voice_cache.
 
         Args:
             text_ids: Tokenized text input (from processor)
             input_ids: Alternative name for text_ids
-            voice_prompt: Voice audio tensor for cloning (legacy, use speech_tensors instead)
-            voice_cache: Pre-encoded voice features (from encode_voice_prompt)
-            speech_tensors: Voice audio tensor from processor for cloning
-            speech_masks: Mask indicating valid voice frames
+            voice_cache: Pre-encoded voice features (dict with "acoustic_mean" tensor)
             speech_input_mask: Boolean mask indicating where to insert voice embeddings
             cfg_scale: Classifier-free guidance scale (higher = more faithful to text)
             max_new_tokens: Maximum tokens to generate
@@ -403,25 +317,14 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         text_ids = text_ids.to(device)
         batch_size = text_ids.shape[0]
 
-        # Handle legacy voice_prompt parameter
-        if voice_prompt is not None and speech_tensors is None:
-            speech_tensors = voice_prompt
-            # Create default speech_masks if not provided
-            if speech_masks is None:
-                # Estimate number of frames from audio length
-                audio_len = voice_prompt.shape[-1]
-                num_frames = (audio_len + 3199) // 3200  # compression ratio
-                speech_masks = torch.ones(batch_size, num_frames, dtype=torch.bool, device=device)
-
         # Get special token IDs
         speech_start_id = getattr(self.config, "speech_start_id", None) or 151652
         speech_end_id = getattr(self.config, "speech_end_id", None) or 151653
         speech_diffusion_id = getattr(self.config, "speech_diffusion_id", None) or 151654
         eos_token_id = getattr(self.config.decoder_config, "eos_token_id", None) or 151643
 
-        # Initialize streaming caches for tokenizers
-        acoustic_cache = KugelAudioTokenizerStreamingCache()
-        semantic_cache = KugelAudioTokenizerStreamingCache()
+        # Initialize streaming cache for acoustic tokenizer only
+        acoustic_cache_streaming = KugelAudioTokenizerStreamingCache()
 
         # Initialize sequences and attention masks
         current_ids = text_ids
@@ -439,31 +342,15 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
         # Get initial embeddings
         inputs_embeds = self.model.get_input_embeddings()(current_ids)
 
-        # Process voice/speech input if provided
-        if speech_tensors is not None or voice_cache is not None:
-            # Get speech embeddings
-            if voice_cache is not None:
-                _, speech_embeds = self._process_speech_inputs(
-                    speech_tensors=None,
-                    speech_masks=None,
-                    voice_cache=voice_cache,
-                )
-            else:
-                # Encode speech_tensors directly
-                speech_tensors = speech_tensors.to(device=device, dtype=dtype)
-                if speech_masks is not None:
-                    speech_masks = speech_masks.to(device)
-                _, speech_embeds = self._process_speech_inputs(
-                    speech_tensors=speech_tensors,
-                    speech_masks=speech_masks,
-                    voice_cache=None,
-                )
+        # Process pre-encoded voice features if provided
+        if voice_cache is not None:
+            _, speech_embeds = self._process_speech_inputs(
+                voice_cache=voice_cache,
+            )
 
             # Insert speech embeddings at positions marked by speech_input_mask
-            # speech_embeds is already flattened to [num_valid_frames, hidden] by _process_speech_inputs
             if speech_input_mask is not None:
                 speech_input_mask = speech_input_mask.to(device)
-                # Directly assign - shapes should match
                 inputs_embeds[speech_input_mask] = speech_embeds
 
         negative_inputs_embeds = self.model.get_input_embeddings()(negative_ids)
@@ -542,8 +429,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
             if speech_end_mask.any():
                 finished = finished | speech_end_mask
                 speech_end_indices = speech_end_mask.nonzero(as_tuple=False).squeeze(-1)
-                acoustic_cache.set_to_zero(speech_end_indices)
-                semantic_cache.set_to_zero(speech_end_indices)
+                acoustic_cache_streaming.set_to_zero(speech_end_indices)
 
             # Handle speech_start tokens - refresh negative model KV cache
             speech_start_mask = (next_tokens == speech_start_id) & ~finished
@@ -655,7 +541,7 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                 # Decode through acoustic tokenizer with streaming cache
                 audio = self.acoustic_tokenizer.decode(
                     scaled_latent.unsqueeze(1).permute(0, 2, 1),
-                    cache=acoustic_cache,
+                    cache=acoustic_cache_streaming,
                     sample_indices=diffusion_indices,
                     use_cache=True,
                 )
@@ -665,19 +551,9 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
                     if not finished[idx]:
                         audio_chunks[idx].append(audio[i].cpu())
 
-                # Encode audio to semantic features with streaming cache
-                semantic_output = self.semantic_tokenizer.encode(
-                    audio,
-                    cache=semantic_cache,
-                    sample_indices=diffusion_indices,
-                    use_cache=True,
-                )
-                semantic_features = semantic_output.mean
-
-                # Compute embeddings for next step
+                # Compute embeddings for next step (acoustic only, no semantic re-encoding)
                 acoustic_embed = self.acoustic_connector(speech_latents.unsqueeze(1))
-                semantic_embed = self.semantic_connector(semantic_features)
-                diffusion_embeds = (acoustic_embed + semantic_embed).squeeze(1)
+                diffusion_embeds = acoustic_embed.squeeze(1)
 
                 # Update embeddings for diffusion samples
                 next_inputs_embeds[diffusion_indices] = diffusion_embeds.unsqueeze(1)
@@ -715,6 +591,25 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
             sequences=current_ids,
             speech_outputs=speech_outputs,
         )
+
+    @staticmethod
+    def load_voice(voice_path: str) -> dict:
+        """Load a pre-encoded voice from a .pt file.
+
+        Args:
+            voice_path: Path to the .pt file containing pre-encoded voice features.
+                The file should contain a dict with at least "acoustic_mean" tensor.
+
+        Returns:
+            Dict suitable for passing as voice_cache to generate().
+        """
+        voice_cache = torch.load(voice_path, map_location="cpu", weights_only=True)
+        if "acoustic_mean" not in voice_cache:
+            raise ValueError(
+                f"Voice file {voice_path} does not contain 'acoustic_mean'. "
+                f"Available keys: {list(voice_cache.keys())}"
+            )
+        return voice_cache
 
     def _apply_watermark(self, audio: torch.Tensor, sample_rate: int = 24000) -> torch.Tensor:
         """Apply imperceptible watermark to generated audio.

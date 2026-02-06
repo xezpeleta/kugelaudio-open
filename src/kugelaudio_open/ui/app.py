@@ -33,32 +33,36 @@ def get_device():
     return "cpu"
 
 
+def _get_available_voices():
+    """Get list of available pre-encoded voices from the loaded processor."""
+    global _processor
+    if _processor is not None:
+        return _processor.get_available_voices()
+    return []
+
+
 def _warmup_model(model, processor=None):
     """Warmup model components to eliminate CUDA kernel compilation overhead on first generation.
-    
-    This runs dummy data through all model components (acoustic decoder, semantic encoder,
+
+    This runs dummy data through all model components (acoustic decoder,
     diffusion head, language model) to trigger JIT compilation before actual inference.
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    
+
     with torch.no_grad():
         # 1. Warmup acoustic decoder (biggest impact - saves ~190ms on first call)
         latent_dim = model.config.acoustic_vae_dim
         dummy_latent = torch.randn(1, latent_dim, 1, device=device, dtype=dtype)
         _ = model.acoustic_tokenizer.decode(dummy_latent)
-        
-        # 2. Warmup semantic encoder
-        dummy_audio = torch.randn(1, 1, 3200, device=device, dtype=dtype)
-        _ = model.semantic_tokenizer.encode(dummy_audio)
-        
-        # 3. Warmup diffusion/prediction head
+
+        # 2. Warmup diffusion/prediction head
         hidden_size = model.config.decoder_config.hidden_size
         model.noise_scheduler.set_timesteps(model.ddpm_inference_steps)
-        
+
         dummy_condition = torch.randn(2, hidden_size, device=device, dtype=dtype)
         dummy_speech = torch.randn(2, latent_dim, device=device, dtype=dtype)
-        
+
         for t in model.noise_scheduler.timesteps:
             half = dummy_speech[:1]
             combined = torch.cat([half, half], dim=0)
@@ -69,22 +73,25 @@ def _warmup_model(model, processor=None):
             )
             dummy_eps = torch.randn_like(dummy_speech)
             dummy_speech = model.noise_scheduler.step(dummy_eps, t, dummy_speech).prev_sample
-        
-        # 4. Warmup language model with KV cache path
+
+        # 3. Warmup language model with KV cache path
         dummy_ids = torch.randint(0, 32000, (1, 64), device=device)
         dummy_mask = torch.ones_like(dummy_ids)
-        _ = model.model.language_model(input_ids=dummy_ids, attention_mask=dummy_mask, use_cache=True)
-        
-        # 5. Warmup acoustic encoder (for voice prompts)
-        dummy_voice = torch.randn(1, 1, 24000, device=device, dtype=dtype)
-        _ = model.acoustic_tokenizer.encode(dummy_voice)
-        
-        # 6. Run a minimal generation to warmup the full generation path
+        _ = model.model.language_model(
+            input_ids=dummy_ids, attention_mask=dummy_mask, use_cache=True
+        )
+
+        # 4. Run a minimal generation to warmup the full generation path
         if processor is not None:
             dummy_inputs = processor(text="Hi.", return_tensors="pt")
-            dummy_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in dummy_inputs.items()}
-            _ = model.generate(**dummy_inputs, cfg_scale=3.0, max_new_tokens=10, show_progress=False)
-        
+            dummy_inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in dummy_inputs.items()
+            }
+            _ = model.generate(
+                **dummy_inputs, cfg_scale=3.0, max_new_tokens=10, show_progress=False
+            )
+
     # Clear memory
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -113,7 +120,7 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
             # Clear CUDA cache to free memory
             if device == "cuda":
                 torch.cuda.empty_cache()
-        
+
         print(f"Loading model {model_id} on {device}...")
         try:
             _model = KugelAudioForConditionalGenerationInference.from_pretrained(
@@ -127,12 +134,14 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
                 torch_dtype=dtype,
             ).to(device)
         _model.eval()
+        # Strip encoder weights to free VRAM (only decoder needed for inference)
+        _model.model.strip_encoders()
         _current_model_id = model_id
         print(f"Model {model_id} loaded!")
 
     if _processor is None:
         _processor = KugelAudioProcessor.from_pretrained(model_id)
-        
+
     # Warmup to eliminate first-generation slowness from CUDA kernel compilation
     # Do this after processor is loaded so we can run a mini-generation
     if device == "cuda" and _model is not None:
@@ -151,23 +160,23 @@ def load_models(model_id: str = "kugelaudio/kugelaudio-0-open"):
 
 def generate_speech(
     text: str,
-    reference_audio: Optional[Tuple[int, np.ndarray]] = None,
+    voice_name: Optional[str] = None,
     model_choice: str = "kugelaudio-0-open",
     cfg_scale: float = 3.0,
     max_tokens: int = 2048,
 ) -> Tuple[int, np.ndarray]:
-    """Generate speech from text.
+    """Generate speech from text using a pre-encoded voice.
 
     Args:
         text: Text to synthesize
-        reference_audio: Optional (sample_rate, audio_array) for voice cloning
+        voice_name: Name of a pre-encoded voice (from voices.json registry)
         model_choice: Model variant to use
         cfg_scale: Classifier-free guidance scale
         max_tokens: Maximum generation tokens
 
     Returns:
         Tuple of (sample_rate, audio_array)
-        
+
     Note:
         All generated audio is automatically watermarked for identification.
     """
@@ -178,65 +187,28 @@ def generate_speech(
     model, processor, watermark = load_models(model_id)
     device = next(model.parameters()).device
 
-    # Process reference audio if provided
-    voice_audio = None
-    if reference_audio is not None:
-        ref_sr, ref_audio = reference_audio
-        print(f"[Voice Cloning] Input audio: sr={ref_sr}, shape={ref_audio.shape}, dtype={ref_audio.dtype}")
-        
-        # Convert to float32 and normalize based on dtype
-        if ref_audio.dtype == np.int16:
-            ref_audio = ref_audio.astype(np.float32) / 32768.0
-        elif ref_audio.dtype == np.int32:
-            ref_audio = ref_audio.astype(np.float32) / 2147483648.0
-        elif ref_audio.dtype == np.float64:
-            ref_audio = ref_audio.astype(np.float32)
-        elif ref_audio.dtype != np.float32:
-            ref_audio = ref_audio.astype(np.float32)
+    # Process text input with optional pre-encoded voice
+    if voice_name and voice_name != "None":
+        inputs = processor(text=text.strip(), voice=voice_name, return_tensors="pt")
+    else:
+        inputs = processor(text=text.strip(), return_tensors="pt")
 
-        # Ensure mono BEFORE resampling (important for stereo files)
-        if ref_audio.ndim > 1:
-            if ref_audio.shape[0] == 2:  # [2, samples] format (channels first)
-                ref_audio = ref_audio.mean(axis=0)
-            elif ref_audio.shape[-1] == 2:  # [samples, 2] format (channels last)
-                ref_audio = ref_audio.mean(axis=-1)
-            elif ref_audio.shape[0] < ref_audio.shape[-1]:  # Likely [channels, samples]
-                ref_audio = ref_audio.mean(axis=0)
-            else:  # Likely [samples, channels]
-                ref_audio = ref_audio.mean(axis=-1)
-        
-        # Ensure 1D
-        ref_audio = ref_audio.squeeze()
-        
-        print(f"[Voice Cloning] After mono conversion: shape={ref_audio.shape}, dtype={ref_audio.dtype}")
-
-        # Resample to 24kHz if needed - this is CRITICAL for voice cloning
-        if ref_sr != 24000:
-            import librosa
-            print(f"[Voice Cloning] Resampling from {ref_sr}Hz to 24000Hz (ratio: {ref_sr/24000:.4f})")
-            ref_audio = librosa.resample(ref_audio, orig_sr=ref_sr, target_sr=24000)
-            print(f"[Voice Cloning] After resampling: shape={ref_audio.shape}, duration={len(ref_audio)/24000:.2f}s")
+    # Move tensors to device, keep dicts as-is
+    model_inputs = {}
+    for k, v in inputs.items():
+        if isinstance(v, torch.Tensor):
+            model_inputs[k] = v.to(device)
         else:
-            print(f"[Voice Cloning] No resampling needed, already at 24kHz")
+            model_inputs[k] = v
 
-        # Normalize audio to reasonable range
-        max_val = np.abs(ref_audio).max()
-        if max_val > 0:
-            ref_audio = ref_audio / max_val * 0.95
-        
-        voice_audio = ref_audio
-        print(f"[Voice Cloning] Final voice audio: shape={voice_audio.shape}, min={voice_audio.min():.4f}, max={voice_audio.max():.4f}, std={voice_audio.std():.4f}")
+    print(
+        f"[Generation] Using model: {model_id}, voice={voice_name}, cfg_scale={cfg_scale}, max_tokens={max_tokens}"
+    )
 
-    # Process text input with optional voice prompt
-    inputs = processor(text=text.strip(), voice_prompt=voice_audio, return_tensors="pt")
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
-    print(f"[Generation] Using model: {model_id}, cfg_scale={cfg_scale}, max_tokens={max_tokens}")
-    
     # Generate
     with torch.no_grad():
         outputs = model.generate(
-            **inputs,
+            **model_inputs,
             cfg_scale=cfg_scale,
             max_new_tokens=max_tokens,
         )
@@ -254,14 +226,18 @@ def generate_speech(
 
     # Ensure correct shape (1D array)
     audio = audio.squeeze()
-    
+
     # Normalize to prevent clipping (important for Gradio playback)
     max_val = np.abs(audio).max()
     if max_val > 1.0:
         audio = audio / max_val * 0.95
-    
-    print(f"[Generation] Final output: shape={audio.shape}, dtype={audio.dtype}, duration={len(audio)/24000:.2f}s")
-    print(f"[Generation] Audio stats: min={audio.min():.4f}, max={audio.max():.4f}, std={audio.std():.4f}")
+
+    print(
+        f"[Generation] Final output: shape={audio.shape}, dtype={audio.dtype}, duration={len(audio)/24000:.2f}s"
+    )
+    print(
+        f"[Generation] Audio stats: min={audio.min():.4f}, max={audio.max():.4f}, std={audio.std():.4f}"
+    )
 
     # Return with explicit sample rate - Gradio expects (sample_rate, audio_array)
     return (24000, audio)
@@ -336,12 +312,12 @@ def create_app() -> "gr.Blocks":
                             max_lines=20,
                         )
 
-                        reference_audio = gr.Audio(
-                            label="Reference Audio (Optional)",
-                            type="numpy",
-                            sources=["upload", "microphone"],
+                        voice_dropdown = gr.Dropdown(
+                            choices=["None"] + _get_available_voices(),
+                            value="None",
+                            label="Voice (Optional)",
+                            info="Select a pre-encoded voice or leave as None for default",
                         )
-                        gr.Markdown("*Upload a voice sample to clone the speaker's voice*")
 
                         with gr.Accordion("Advanced Settings", open=False):
                             model_choice = gr.Dropdown(
@@ -379,14 +355,14 @@ def create_app() -> "gr.Blocks":
                             """
                         ### Tips
                         - For best results, use clear and well-punctuated text
-                        - Reference audio should be 5-30 seconds of clear speech
-                        - The 7B model produces higher quality but is slower
+                        - Select a voice from the dropdown to use a specific speaker
+                        - Leave voice as "None" for default generation
                         """
                         )
 
                 generate_btn.click(
                     fn=generate_speech,
-                    inputs=[text_input, reference_audio, model_choice, cfg_scale, max_tokens],
+                    inputs=[text_input, voice_dropdown, model_choice, cfg_scale, max_tokens],
                     outputs=[output_audio],
                 )
 

@@ -1,0 +1,17 @@
+{
+  "default": {
+    "file": "default.pt",
+    "description": "Default neutral voice",
+    "language": "en"
+  },
+  "warm": {
+    "file": "warm.pt",
+    "description": "Warm, friendly voice",
+    "language": "en"
+  },
+  "clear": {
+    "file": "clear.pt",
+    "description": "Clear, professional voice",
+    "language": "en"
+  }
+}
